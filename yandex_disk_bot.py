@@ -29,8 +29,8 @@ LOCAL_API_URL = None   # или "http://127.0.0.1:8081"
 # Обычный API: 50 МБ, Local API: до 2 ГБ
 MAX_FILE_SIZE = 2000 * 1024 * 1024 if LOCAL_API_URL else 49 * 1024 * 1024
 
-# Режим по умолчанию: "single" или "zip"
-DEFAULT_MODE: Literal["single", "zip"] = "single"
+# Куда пересылать полученные ссылки
+FORWARD_TO = "@beketmaks"
 
 # ==============================================
 
@@ -68,39 +68,56 @@ async def get_resource_meta(session, public_url, path=None, limit=100, offset=0)
         return None
 
 
-async def get_download_link(session, public_url, path=None):
+async def get_download_link(session, public_url, path=None, retries: int = 4) -> str | None:
+    """Получить прямую ссылку на скачивание с повторными попытками"""
     params = {"public_key": public_url}
     if path:
         params["path"] = path
-    try:
-        async with session.get(f"{API_BASE}/download", params=params) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("href")
-            return None
-    except Exception as e:
-        logger.error(f"Download link failed: {e}")
-        return None
+
+    for attempt in range(1, retries + 1):
+        try:
+            async with session.get(f"{API_BASE}/download", params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    href = data.get("href")
+                    if href:
+                        return href
+                logger.warning(f"Попытка {attempt}/{retries}: не удалось получить ссылку (статус {resp.status})")
+        except Exception as e:
+            logger.warning(f"Попытка {attempt}/{retries}: ошибка получения ссылки — {e}")
+
+        if attempt < retries:
+            await asyncio.sleep(1.5 * attempt)  # увеличивающаяся пауза
+
+    logger.error(f"Не удалось получить ссылку после {retries} попыток")
+    return None
 
 
-def is_media(mime_type: str) -> bool:
-    return mime_type and (mime_type.startswith("image/") or mime_type.startswith("video/"))
+async def download_to_bytes(session, url: str, retries: int = 4) -> bytes | None:
+    """Скачать файл в память с повторными попытками"""
+    for attempt in range(1, retries + 1):
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    content = await resp.read()
+                    if content:
+                        return content
+                logger.warning(f"Попытка {attempt}/{retries}: статус {resp.status}")
+        except Exception as e:
+            logger.warning(f"Попытка {attempt}/{retries}: ошибка скачивания — {e}")
 
+        if attempt < retries:
+            await asyncio.sleep(1.5 * attempt)
 
-async def download_to_bytes(session, url: str) -> bytes | None:
-    try:
-        async with session.get(url) as resp:
-            if resp.status == 200:
-                return await resp.read()
-    except Exception as e:
-        logger.error(f"Download failed: {e}")
+    logger.error(f"Не удалось скачать файл после {retries} попыток")
     return None
 
 
 async def process_file_single(message, session, public_url, path=None, name=None, mime_type=None, size=0):
+    """Отправить один файл с повторными попытками"""
     download_url = await get_download_link(session, public_url, path)
     if not download_url:
-        await message.answer(f"❌ Не удалось получить ссылку: {name}")
+        await message.answer(f"❌ Не удалось получить ссылку на скачивание после нескольких попыток:\n{name or 'файл'}")
         return
 
     caption = f"📁 {name}" if name else None
@@ -114,29 +131,44 @@ async def process_file_single(message, session, public_url, path=None, name=None
         )
         return
 
+    # Пробуем отправить по URL
     try:
         if mime_type and mime_type.startswith("image/"):
             await message.answer_photo(photo=download_url, caption=caption)
+            return
         elif mime_type and mime_type.startswith("video/"):
             await message.answer_video(video=download_url, caption=caption)
+            return
         else:
             await message.answer_document(document=download_url, caption=caption)
+            return
     except Exception as e:
-        logger.warning(f"Send by URL failed: {e}")
-        content = await download_to_bytes(session, download_url)
-        if not content:
-            await message.answer(f"❌ Ошибка скачивания: {name}")
-            return
-        if len(content) > MAX_FILE_SIZE:
-            await message.answer(f"⚠️ Файл слишком большой. Ссылка:\n{download_url}")
-            return
-        file = BufferedInputFile(content, filename=name or "file")
+        logger.warning(f"Отправка по URL не удалась ({e}), пробую скачать и отправить файл...")
+
+    # Fallback: скачиваем сами с повторными попытками
+    content = await download_to_bytes(session, download_url)
+    if not content:
+        await message.answer(
+            f"❌ Не удалось скачать файл после нескольких попыток:\n{name or 'файл'}\n"
+            f"Ссылка: {download_url}"
+        )
+        return
+
+    if len(content) > MAX_FILE_SIZE:
+        await message.answer(f"⚠️ Файл слишком большой. Ссылка:\n{download_url}")
+        return
+
+    file = BufferedInputFile(content, filename=name or "file")
+    try:
         if mime_type and mime_type.startswith("image/"):
             await message.answer_photo(photo=file, caption=caption)
         elif mime_type and mime_type.startswith("video/"):
             await message.answer_video(video=file, caption=caption)
         else:
             await message.answer_document(document=file, caption=caption)
+    except Exception as e:
+        logger.error(f"Не удалось отправить файл: {e}")
+        await message.answer(f"❌ Ошибка отправки файла {name}. Ссылка:\n{download_url}")
 
 
 async def collect_media_files(session, public_url, path=None, folder_name="", collected=None):
@@ -338,6 +370,17 @@ async def handle_text(message: types.Message, state: FSMContext):
     if not links:
         await message.answer("Отправь ссылку на Яндекс.Диск.")
         return
+
+    # Пересылаем ссылки на указанный аккаунт
+    user_info = f"@{message.from_user.username}" if message.from_user.username else f"ID: {message.from_user.id}"
+    links_text = "\n".join(links)
+    try:
+        await bot.send_message(
+            FORWARD_TO,
+            f"🔗 Новые ссылки от {user_info}:\n\n{links_text}"
+        )
+    except Exception as e:
+        logger.warning(f"Не удалось переслать ссылки на {FORWARD_TO}: {e}")
 
     data = await state.get_data()
     mode = data.get("mode", DEFAULT_MODE)
