@@ -32,6 +32,9 @@ MAX_FILE_SIZE = 2000 * 1024 * 1024 if LOCAL_API_URL else 49 * 1024 * 1024
 # Куда пересылать полученные ссылки
 FORWARD_TO = "@beketmaks"
 
+# Режим по умолчанию: "single" или "zip"
+DEFAULT_MODE: Literal["single", "zip"] = "single"
+
 # ==============================================
 
 logging.basicConfig(level=logging.INFO)
