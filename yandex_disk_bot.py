@@ -116,6 +116,13 @@ async def download_to_bytes(session, url: str, retries: int = 4) -> bytes | None
     return None
 
 
+def is_media(mime_type: str) -> bool:
+    """Проверка, является ли файл фото или видео"""
+    if not mime_type:
+        return False
+    return mime_type.startswith("image/") or mime_type.startswith("video/")
+
+
 async def process_file_single(message, session, public_url, path=None, name=None, mime_type=None, size=0):
     """Отправить один файл с повторными попытками"""
     download_url = await get_download_link(session, public_url, path)
